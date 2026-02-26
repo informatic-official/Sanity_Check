@@ -454,8 +454,8 @@ def get_capture_time_bounds(path: str) -> dict:
 def main(argv: list[str]) -> int:
     """
     Command-line usage:
-        python pcap_timestamp_optimized.py capture.pcap
-        python pcap_timestamp_optimized.py capture.pcapng
+        python pcap_timestamp.py capture.pcap
+        python pcap_timestamp.py capture.pcapng
     """
     if len(argv) != 2:
         print(f"Usage: {argv[0]} <capture.pcap|capture.pcapng>")
@@ -476,3 +476,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
+
