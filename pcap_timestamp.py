@@ -18,18 +18,25 @@ Output format:
 Highlights / Robustness Features:
     • Magic-number based format detection (extension is only a fallback)
     • PCAP: supports microsecond and nanosecond variants; skips payload via seek
+    • PCAP: lenient mode for non-standard captures with untrustworthy snaplen
     • PCAPNG: block-stream parsing with:
         - SHB re-detection inside the stream (multi-section files)
-        - per-interface if_tsresol handling (decimal + binary)
+        - mid-stream SHB byte-order switch handled correctly end-to-end
+        - per-interface if_tsresol handling (decimal + binary, with magnitude cap)
         - block trailer-length validation
+        - truncated options raise instead of silently misparse
         - large packet blocks handled without reading full payload into memory
     • Defensive checks: 4-byte alignment, minimum sizes, sanity caps
     • Out-of-order timestamp detection with explicit warning
+    • Python 3.8+ compatible (via from __future__ import annotations)
 """
+
+from __future__ import annotations
 
 import os
 import struct
 import sys
+import warnings
 from datetime import datetime, timezone
 
 
@@ -92,13 +99,25 @@ def _tsresol_to_scale(tsresol_byte: int) -> float:
 
     We return the divisor to convert raw ts_64 → seconds:
         seconds = ts_64 / divisor
+
+    Magnitude is capped at 60 for binary and 18 for decimal to guard
+    against corrupt/pathological values that would produce inf or
+    completely meaningless timestamps.
     """
     magnitude = tsresol_byte & 0x7F
     if tsresol_byte & 0x80:
         # binary resolution: 2^-m seconds per tick => ticks per second = 2^m
+        if magnitude > 60:
+            raise CaptureParseError(
+                f"if_tsresol binary magnitude {magnitude} is unreasonably large (max 60)."
+            )
         return float(1 << magnitude)
     else:
         # decimal resolution: 10^-m seconds per tick => ticks per second = 10^m
+        if magnitude > 18:
+            raise CaptureParseError(
+                f"if_tsresol decimal magnitude {magnitude} is unreasonably large (max 18)."
+            )
         return float(10 ** magnitude)
 
 
@@ -109,12 +128,18 @@ def _parse_options(data: bytes, endian: str) -> dict:
     """
     Parse PCAPNG options encoded as TLV with 32-bit padding.
 
+    Each record:
+        uint16 option_code
+        uint16 option_length
+        uint8[option_length] value  (padded to 4-byte boundary)
+
+    Raises CaptureParseError on truncated or malformed options.
     Returns: dict mapping option_code -> list[raw_value_bytes]
     """
     options: dict[int, list[bytes]] = {}
     offset = 0
     fmt = endian + "HH"
-    fmt_size = struct.calcsize(fmt)
+    fmt_size = struct.calcsize(fmt)  # always 4
 
     while offset + fmt_size <= len(data):
         code, length = struct.unpack_from(fmt, data, offset)
@@ -122,6 +147,13 @@ def _parse_options(data: bytes, endian: str) -> dict:
 
         if code == _OPT_ENDOFOPT:
             break
+
+        # Guard: value must fit inside the remaining data
+        if offset + length > len(data):
+            raise CaptureParseError(
+                f"Truncated option: code={code}, declared length={length}, "
+                f"but only {len(data) - offset} bytes remain."
+            )
 
         value = data[offset: offset + length]
         options.setdefault(code, []).append(value)
@@ -167,8 +199,15 @@ def _sniff_capture_format(path: str) -> str:
 # ==========================================================
 # PCAP Parsing
 # ==========================================================
-def _parse_pcap_time_bounds(path: str) -> dict:
-    """Parse classic PCAP and return timestamp bounds (first/last by file order)."""
+def _parse_pcap_time_bounds(path: str, *, lenient: bool = False) -> dict:
+    """
+    Parse classic PCAP and return timestamp bounds (first/last by file order).
+
+    lenient:
+        If False (default), raise if incl_len exceeds snaplen (strict/safe).
+        If True, emit a warning and skip the offending packet instead of
+        raising, for non-standard captures where snaplen is untrustworthy.
+    """
     with open(path, "rb") as f:
         gh = _read_exact(f, 24)
         magic_raw = gh[:4]
@@ -204,9 +243,18 @@ def _parse_pcap_time_bounds(path: str) -> dict:
             ts_sec, ts_frac, incl_len, _orig_len = pkt_hdr_struct.unpack(header_bytes)
 
             if incl_len > max_incl_len:
-                raise CaptureParseError(
-                    f"Packet incl_len ({incl_len}) exceeds snaplen ({max_incl_len}). File may be corrupt."
+                msg = (
+                    f"Packet incl_len ({incl_len}) exceeds snaplen "
+                    f"({max_incl_len}). File may be corrupt."
                 )
+                if lenient:
+                    warnings.warn(msg + " Skipping packet.", stacklevel=2)
+                    # Best-effort: attempt to skip, but incl_len itself may be
+                    # garbage; if seek goes past EOF the next _read_exact will
+                    # raise EOFError and we'll stop cleanly.
+                    f.seek(incl_len, os.SEEK_CUR)
+                    continue
+                raise CaptureParseError(msg)
 
             if incl_len:
                 f.seek(incl_len, os.SEEK_CUR)
@@ -221,7 +269,6 @@ def _parse_pcap_time_bounds(path: str) -> dict:
             raise CaptureParseError("No packets found in PCAP file.")
 
         if last_ts < first_ts:
-            import warnings
             warnings.warn(
                 f"Out-of-order timestamps detected: last packet ({last_ts}) is "
                 f"earlier than first ({first_ts}). Duration clamped to 0.",
@@ -323,27 +370,58 @@ def _parse_pcapng_time_bounds(path: str, *, strict_iface: bool = False) -> dict:
 
             # ---------- Section Header Block (may appear mid-stream) ----------
             if block_type == _BT_SHB:
-                body = _read_exact(f, body_len)
-                trailer_bytes = _read_exact(f, 4)
-
-                # FIX: Determine the NEW endianness from BOM *before* validating
-                # the trailer. If the new section flips byte order, using the old
-                # endian to unpack the trailer would produce a wrong value and
-                # raise a false "trailer mismatch" error.
-                bom2 = body[:4]
-                if bom2 == b"\x1a\x2b\x3c\x4d":
+                # CRITICAL FIX: At this point `block_length` was decoded with
+                # the *old* endian. If the new section has a different byte
+                # order, that value is wrong and body_len / _read_exact would
+                # consume the wrong number of bytes, corrupting all subsequent
+                # reads.
+                #
+                # Correct procedure:
+                #   1. Read the first 4 bytes of the SHB body — that is the BOM.
+                #   2. Determine new_endian from the BOM.
+                #   3. Re-decode block_length from hdr[4:8] with new_endian.
+                #   4. Read the remaining body + trailer using the correct sizes.
+                #   5. Validate trailer with new_endian.
+                #
+                # We already consumed 8 bytes (hdr). The SHB body starts
+                # immediately after; BOM is its first 4 bytes.
+                bom_bytes = _read_exact(f, 4)
+                if bom_bytes == b"\x1a\x2b\x3c\x4d":
                     new_endian = ">"
-                elif bom2 == b"\x4d\x3c\x2b\x1a":
+                elif bom_bytes == b"\x4d\x3c\x2b\x1a":
                     new_endian = "<"
                 else:
-                    raise CaptureParseError(f"Invalid SHB BOM in stream: {bom2.hex()}")
+                    raise CaptureParseError(
+                        f"Invalid SHB BOM in stream: {bom_bytes.hex()}"
+                    )
 
-                # Validate trailer with the (potentially updated) endian
-                trailer_len = struct.unpack(new_endian + "I", trailer_bytes)[0]
-                if trailer_len != block_length:
-                    raise CaptureParseError("Block length trailer mismatch (SHB).")
+                # Re-decode block_length with the correct endianness
+                true_block_length = struct.unpack(new_endian + "I", hdr[4:8])[0]
+                if true_block_length < 28:
+                    raise CaptureParseError(
+                        f"Mid-stream SHB block_length {true_block_length} too small."
+                    )
+                if true_block_length % 4 != 0:
+                    raise CaptureParseError(
+                        f"Mid-stream SHB block_length {true_block_length} not 4-byte aligned."
+                    )
+                if true_block_length > _MAX_SANE_BLOCK_LENGTH:
+                    raise CaptureParseError(
+                        f"Mid-stream SHB block_length {true_block_length} exceeds sanity cap."
+                    )
 
-                # Commit endian change and rebuild the block-header struct
+                # Read the rest of the body (already consumed 8 hdr + 4 BOM = 12)
+                # plus the trailing 4-byte length copy
+                remaining_body = _read_exact(f, true_block_length - 12)
+
+                # Validate trailer with new_endian
+                trailer_len = struct.unpack(
+                    new_endian + "I", remaining_body[-4:]
+                )[0]
+                if trailer_len != true_block_length:
+                    raise CaptureParseError("Block length trailer mismatch (mid-stream SHB).")
+
+                # Commit endian change and reset per-section state
                 endian = new_endian
                 blk_hdr_struct = struct.Struct(endian + "II")
                 iface_tsresol.clear()
@@ -433,7 +511,6 @@ def _parse_pcapng_time_bounds(path: str, *, strict_iface: bool = False) -> dict:
             raise CaptureParseError("No timestamped packets found in PCAPNG file.")
 
         if last_ts < first_ts:
-            import warnings
             warnings.warn(
                 f"Out-of-order timestamps detected: last packet ({last_ts}) is "
                 f"earlier than first ({first_ts}). Duration clamped to 0.",
