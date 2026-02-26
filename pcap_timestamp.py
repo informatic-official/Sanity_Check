@@ -5,30 +5,25 @@
 PCAP / PCAPNG Time Range Extraction Script
 ==========================================
 
-Purpose:
---------
 This script reads a .pcap or .pcapng capture file and extracts:
-
-    • Timestamp of the first packet
-    • Timestamp of the last packet
+    • Timestamp of the first packet (by file order)
+    • Timestamp of the last packet (by file order)
     • Total capture duration in seconds
 
 Output format:
---------------
     First packet: <ISO8601 datetime> (<epoch seconds>)
     Last packet:  <ISO8601 datetime> (<epoch seconds>)
     Duration:     <seconds>
 
-Core Concepts Covered:
-----------------------
-    • Binary file parsing
-    • struct module usage
-    • Endianness detection (big-endian vs little-endian)
-    • PCAP file format structure
-    • PCAPNG block-based structure
-    • Timestamp resolution handling (microsecond & nanosecond)
-    • IDB if_tsresol option parsing per interface
-    • OPB (Obsolete Packet Block) support
+Highlights / Robustness Features:
+    • Magic-number based format detection (extension is only a fallback)
+    • PCAP: supports microsecond and nanosecond variants; skips payload via seek
+    • PCAPNG: block-stream parsing with:
+        - SHB re-detection inside the stream (multi-section files)
+        - per-interface if_tsresol handling (decimal + binary)
+        - block trailer-length validation
+        - large packet blocks handled without reading full payload into memory
+    • Defensive checks: 4-byte alignment, minimum sizes, sanity caps
 """
 
 import os
@@ -41,10 +36,7 @@ from datetime import datetime, timezone
 # Custom Exception for Capture Parsing Errors
 # ==========================================================
 class CaptureParseError(Exception):
-    """
-    Raised when the capture file is malformed, truncated,
-    or does not conform to the expected PCAP/PCAPNG format.
-    """
+    """Raised when the capture file is malformed, truncated, or unexpected."""
     pass
 
 
@@ -52,15 +44,15 @@ class CaptureParseError(Exception):
 # Constants
 # ==========================================================
 # PCAPNG Block Types
-_BT_SHB  = 0x0A0D0D0A  # Section Header Block
-_BT_IDB  = 0x00000001  # Interface Description Block
-_BT_OPB  = 0x00000002  # Obsolete Packet Block
-_BT_SPB  = 0x00000003  # Simple Packet Block (no timestamp)
-_BT_EPB  = 0x00000006  # Enhanced Packet Block
+_BT_SHB = 0x0A0D0D0A  # Section Header Block
+_BT_IDB = 0x00000001  # Interface Description Block
+_BT_OPB = 0x00000002  # Obsolete Packet Block
+_BT_SPB = 0x00000003  # Simple Packet Block (no timestamp)
+_BT_EPB = 0x00000006  # Enhanced Packet Block
 
 # PCAPNG Option Codes
-_OPT_ENDOFOPT  = 0
-_IDB_OPT_TSRESOL = 9   # if_tsresol option in IDB
+_OPT_ENDOFOPT = 0
+_IDB_OPT_TSRESOL = 9  # if_tsresol option in IDB
 
 # Default PCAPNG timestamp resolution: 10^-6 (microseconds)
 _DEFAULT_TSRESOL_EXPONENT = 6
@@ -71,16 +63,7 @@ _MAX_SANE_BLOCK_LENGTH = 256 * 1024 * 1024  # 256 MB sanity cap
 # Helper: Exact Byte Reader
 # ==========================================================
 def _read_exact(f, n: int) -> bytes:
-    """
-    Read exactly 'n' bytes from file object 'f'.
-
-    f.read(n) may return fewer than n bytes without raising an error
-    (e.g. at end-of-file). For binary protocol parsing, incomplete
-    reads indicate corruption or truncation.
-
-    Raises:
-        EOFError if fewer than n bytes are read.
-    """
+    """Read exactly n bytes or raise EOFError."""
     data = f.read(n)
     if len(data) != n:
         raise EOFError(f"Expected {n} bytes, got {len(data)} (truncated file).")
@@ -91,34 +74,31 @@ def _read_exact(f, n: int) -> bytes:
 # Helper: Convert Epoch Timestamp to ISO8601 UTC
 # ==========================================================
 def _to_utc_iso(ts: float) -> str:
-    """
-    Convert a UNIX epoch timestamp (seconds) to
-    an ISO8601 formatted UTC datetime string.
-    """
+    """Convert UNIX epoch seconds to ISO8601 UTC string."""
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
 # ==========================================================
-# Helper: Decode if_tsresol option value → scale factor
+# Helper: Decode if_tsresol option value → scale factor (units per second)
 # ==========================================================
 def _tsresol_to_scale(tsresol_byte: int) -> float:
     """
-    Convert a single if_tsresol byte to the corresponding
-    number of timestamp units per second.
+    Convert a single if_tsresol byte to units-per-second.
 
     PCAPNG spec:
-        bit 7 == 0 → resolution = 10^(-tsresol_byte & 0x7F)   (decimal)
-        bit 7 == 1 → resolution = 2^(-(tsresol_byte & 0x7F))  (binary)
+        bit 7 == 0 → resolution = 10^(-m) where m = (byte & 0x7F)
+        bit 7 == 1 → resolution = 2^(-m)  where m = (byte & 0x7F)
 
-    Returns the divisor to convert raw ts_64 → seconds.
-    e.g., tsresol=6 → 1_000_000 (microseconds)
-          tsresol=9 → 1_000_000_000 (nanoseconds)
+    We return the divisor to convert raw ts_64 → seconds:
+        seconds = ts_64 / divisor
     """
     magnitude = tsresol_byte & 0x7F
     if tsresol_byte & 0x80:
-        return float(1 << magnitude)   # 2^magnitude
+        # binary resolution: 2^-m seconds per tick => ticks per second = 2^m
+        return float(1 << magnitude)
     else:
-        return float(10 ** magnitude)  # 10^magnitude
+        # decimal resolution: 10^-m seconds per tick => ticks per second = 10^m
+        return float(10 ** magnitude)
 
 
 # ==========================================================
@@ -126,15 +106,9 @@ def _tsresol_to_scale(tsresol_byte: int) -> float:
 # ==========================================================
 def _parse_options(data: bytes, endian: str) -> dict:
     """
-    Parse the options section of a PCAPNG block.
+    Parse PCAPNG options encoded as TLV with 32-bit padding.
 
-    Options are encoded as TLV (Type-Length-Value) records,
-    each padded to a 4-byte boundary:
-        uint16 option_code
-        uint16 option_length
-        uint8[option_length] option_value  (+ padding)
-
-    Returns a dict mapping option_code → list of raw value bytes.
+    Returns: dict mapping option_code -> list[raw_value_bytes]
     """
     options: dict[int, list[bytes]] = {}
     offset = 0
@@ -151,7 +125,7 @@ def _parse_options(data: bytes, endian: str) -> dict:
         value = data[offset: offset + length]
         options.setdefault(code, []).append(value)
 
-        # Advance past value + 4-byte padding
+        # Advance past value + padding to 4-byte boundary
         padded = (length + 3) & ~3
         offset += padded
 
@@ -159,40 +133,44 @@ def _parse_options(data: bytes, endian: str) -> dict:
 
 
 # ==========================================================
+# Helper: sniff format by magic number
+# ==========================================================
+def _sniff_capture_format(path: str) -> str:
+    """
+    Return "pcap" or "pcapng" based on file magic number.
+    Falls back to extension only if magic is unknown.
+    """
+    with open(path, "rb") as f:
+        b = f.read(4)
+        if len(b) < 4:
+            raise CaptureParseError("File too small to be a valid capture.")
+
+    # PCAPNG: block type of SHB at file start
+    if b == b"\x0a\x0d\x0d\x0a":
+        return "pcapng"
+
+    # PCAP magic numbers (microsecond / nanosecond, both endians)
+    if b in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4",  # us
+             b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d"):  # ns
+        return "pcap"
+
+    # fallback: extension
+    ext = os.path.splitext(path.lower())[1]
+    if ext == ".pcapng":
+        return "pcapng"
+    if ext == ".pcap":
+        return "pcap"
+    raise CaptureParseError("Unsupported/unknown capture format (magic + extension).")
+
+
+# ==========================================================
 # PCAP Parsing
 # ==========================================================
 def _parse_pcap_time_bounds(path: str) -> dict:
-    """
-    Parse a classic PCAP file and return timestamp bounds.
-
-    PCAP File Layout:
-    -----------------
-        Global Header (24 bytes)
-        [ Packet Header (16 bytes) + Packet Data (incl_len bytes) ] * N
-
-    Global Header (24 bytes):
-        uint32 magic_number
-        uint16 version_major
-        uint16 version_minor
-        int32  thiszone
-        uint32 sigfigs
-        uint32 snaplen
-        uint32 network
-
-    Packet Header (16 bytes):
-        uint32 ts_sec
-        uint32 ts_frac   (microseconds or nanoseconds)
-        uint32 incl_len  (captured length)
-        uint32 orig_len  (original length)
-    """
+    """Parse classic PCAP and return timestamp bounds (first/last by file order)."""
     with open(path, "rb") as f:
-
-        # --------------------------------------------------
-        # 1. Read & Validate Global Header (24 bytes)
-        # --------------------------------------------------
-        global_header = _read_exact(f, 24)
-
-        magic_raw = global_header[:4]
+        gh = _read_exact(f, 24)
+        magic_raw = gh[:4]
         magic_be = struct.unpack(">I", magic_raw)[0]
         magic_le = struct.unpack("<I", magic_raw)[0]
 
@@ -203,49 +181,32 @@ def _parse_pcap_time_bounds(path: str) -> dict:
             endian = "<"
             magic = magic_le
         else:
-            raise CaptureParseError(
-                f"Invalid PCAP magic number: 0x{magic_raw.hex().upper()}"
-            )
+            raise CaptureParseError(f"Invalid PCAP magic number: 0x{magic_raw.hex().upper()}")
 
-        # 0xA1B23C4D → nanosecond resolution; 0xA1B2C3D4 → microsecond
+        # 0xA1B23C4D → nanosecond; 0xA1B2C3D4 → microsecond
         is_nanosecond = (magic == 0xA1B23C4D)
         scale = 1_000_000_000 if is_nanosecond else 1_000_000
 
-        # Extract snaplen from global header for sanity-checking incl_len
-        snaplen = struct.unpack(endian + "I", global_header[16:20])[0]
-        # A snaplen of 0 means "no limit" in some tools; use a safe upper bound
+        snaplen = struct.unpack(endian + "I", gh[16:20])[0]
         max_incl_len = snaplen if snaplen > 0 else 262144
 
-        # --------------------------------------------------
-        # 2. Precompile Packet Header Struct for Performance
-        # --------------------------------------------------
         pkt_hdr_struct = struct.Struct(endian + "IIII")
-
         first_ts = None
         last_ts = None
 
-        # --------------------------------------------------
-        # 3. Iterate Over All Packets
-        # --------------------------------------------------
         while True:
-            # FIX: use try/except EOFError for clean loop termination
-            # instead of manually checking len(header_bytes)
             try:
                 header_bytes = _read_exact(f, 16)
             except EOFError:
                 break
 
-            ts_sec, ts_frac, incl_len, _orig_len = \
-                pkt_hdr_struct.unpack(header_bytes)
+            ts_sec, ts_frac, incl_len, _orig_len = pkt_hdr_struct.unpack(header_bytes)
 
-            # FIX: Guard against corrupt incl_len allocating huge memory
             if incl_len > max_incl_len:
                 raise CaptureParseError(
-                    f"Packet incl_len ({incl_len}) exceeds snaplen "
-                    f"({max_incl_len}). File may be corrupt."
+                    f"Packet incl_len ({incl_len}) exceeds snaplen ({max_incl_len}). File may be corrupt."
                 )
 
-            # OPT: seek past payload instead of reading it into memory
             if incl_len:
                 f.seek(incl_len, os.SEEK_CUR)
 
@@ -258,211 +219,212 @@ def _parse_pcap_time_bounds(path: str) -> dict:
         if first_ts is None:
             raise CaptureParseError("No packets found in PCAP file.")
 
+        duration = max(0.0, float(last_ts - first_ts))
+
         return {
             "first_timestamp": first_ts,
             "last_timestamp": last_ts,
             "first_datetime": _to_utc_iso(first_ts),
             "last_datetime": _to_utc_iso(last_ts),
-            "duration_seconds": float(last_ts - first_ts),
+            "duration_seconds": duration,
         }
 
 
 # ==========================================================
 # PCAPNG Parsing
 # ==========================================================
-def _parse_pcapng_time_bounds(path: str) -> dict:
+def _parse_pcapng_time_bounds(path: str, *, strict_iface: bool = False) -> dict:
     """
-    Parse a PCAPNG file and extract timestamp bounds.
+    Parse a PCAPNG file and return timestamp bounds (first/last by file order).
 
-    PCAPNG is block-based. Each block has the layout:
-        uint32 Block Type
-        uint32 Block Total Length   (entire block including these two fields
-                                     AND the trailing copy of Block Total Length)
-        uint8[...] Block Body
-        uint32 Block Total Length   (trailing copy for backward traversal)
-
-    Block types handled:
-        SHB (0x0A0D0D0A) – Section Header, sets endianness
-        IDB (0x00000001) – Interface Description, may carry if_tsresol
-        EPB (0x00000006) – Enhanced Packet Block, primary packet carrier
-        OPB (0x00000002) – Obsolete Packet Block, also carries timestamps
-        SPB (0x00000003) – Simple Packet Block, NO timestamp → skipped
-
-    FIX: Previously the SHB trailing bytes were not consumed, which
-    shifted the file pointer and corrupted all subsequent block reads.
-
-    FIX: IDB if_tsresol option is now parsed per-interface so that
-    nanosecond-resolution captures are handled correctly.
-
-    FIX: OPB timestamps are now extracted.
+    strict_iface:
+        If True, raise if an EPB/OPB references an unknown interface_id.
+        If False (default), fall back to default tsresol for unknown iface IDs.
     """
     with open(path, "rb") as f:
-
-        # --------------------------------------------------
-        # 1. Read & Validate Section Header Block
-        # --------------------------------------------------
-        # We need at least 12 bytes to read block_type + block_length
-        # + byte_order_magic before we know endianness.
+        # ---- Read initial SHB prefix to determine endianness ----
         shb_prefix = _read_exact(f, 12)
 
         block_type = struct.unpack("<I", shb_prefix[:4])[0]
         if block_type != _BT_SHB:
             raise CaptureParseError(
-                f"Expected Section Header Block (0x0A0D0D0A), "
-                f"got 0x{block_type:08X}."
+                f"Expected Section Header Block (0x0A0D0D0A), got 0x{block_type:08X}."
             )
 
-        # Byte-order magic at offset 8 determines endianness
         bom = shb_prefix[8:12]
         if bom == b"\x1a\x2b\x3c\x4d":
             endian = ">"
         elif bom == b"\x4d\x3c\x2b\x1a":
             endian = "<"
         else:
-            raise CaptureParseError(
-                f"Invalid PCAPNG byte-order magic: {bom.hex()}"
-            )
+            raise CaptureParseError(f"Invalid PCAPNG byte-order magic: {bom.hex()}")
 
-        # Now re-read block_length with correct endianness
         shb_length = struct.unpack(endian + "I", shb_prefix[4:8])[0]
         if shb_length < 28:
-            raise CaptureParseError(
-                f"SHB block_length {shb_length} is too small (minimum 28)."
-            )
+            raise CaptureParseError(f"SHB block_length {shb_length} is too small (minimum 28).")
+        if shb_length % 4 != 0:
+            raise CaptureParseError(f"SHB block_length {shb_length} is not 4-byte aligned.")
+        if shb_length > _MAX_SANE_BLOCK_LENGTH:
+            raise CaptureParseError(f"SHB block_length {shb_length} exceeds sanity cap.")
 
-        # FIX: Consume the remainder of SHB so the file pointer is correct.
-        # Already read 12 bytes; skip the rest (including trailing length copy).
-        f.seek(shb_length - 12, os.SEEK_CUR)
+        # Read remainder of SHB (body remainder + trailer length) and validate trailer
+        shb_rem = _read_exact(f, shb_length - 12)
+        trailer = struct.unpack(endian + "I", shb_rem[-4:])[0]
+        if trailer != shb_length:
+            raise CaptureParseError("SHB trailer length mismatch.")
 
-        # --------------------------------------------------
-        # 2. Per-interface timestamp resolution table
-        # --------------------------------------------------
-        # Maps interface_id (0-based) → divisor (units per second)
+        # ---- per-interface ts resolution table + iface counter ----
         iface_tsresol: dict[int, float] = {}
+        next_iface_id = 0
 
-        def _get_tsresol(iface_id: int) -> float:
-            """Return divisor for given interface, defaulting to 1e6 (µs)."""
-            return iface_tsresol.get(
-                iface_id,
-                10 ** _DEFAULT_TSRESOL_EXPONENT
-            )
+        def _default_divisor() -> float:
+            return float(10 ** _DEFAULT_TSRESOL_EXPONENT)
+
+        def _get_divisor(iface_id: int) -> float:
+            if iface_id in iface_tsresol:
+                return iface_tsresol[iface_id]
+            if strict_iface:
+                raise CaptureParseError(f"Unknown interface_id {iface_id} referenced before IDB.")
+            return _default_divisor()
 
         first_ts = None
         last_ts = None
 
-        # --------------------------------------------------
-        # 3. Iterate Through All Blocks
-        # --------------------------------------------------
         blk_hdr_struct = struct.Struct(endian + "II")
 
+        # ---- stream through all following blocks ----
         while True:
             hdr = f.read(8)
             if not hdr:
-                break  # Clean EOF
+                break
             if len(hdr) != 8:
                 raise CaptureParseError("Truncated block header.")
 
             block_type, block_length = blk_hdr_struct.unpack(hdr)
 
-            # FIX: Sanity-check block_length before any allocation
             if block_length < 12:
-                raise CaptureParseError(
-                    f"Block length {block_length} is impossibly small "
-                    f"(minimum 12 bytes for type+length+length)."
-                )
+                raise CaptureParseError(f"Block length {block_length} is too small (min 12).")
+            if block_length % 4 != 0:
+                raise CaptureParseError(f"Block length {block_length} is not 4-byte aligned.")
             if block_length > _MAX_SANE_BLOCK_LENGTH:
                 raise CaptureParseError(
-                    f"Block length {block_length} exceeds sanity cap "
-                    f"({_MAX_SANE_BLOCK_LENGTH} bytes). File may be corrupt."
+                    f"Block length {block_length} exceeds sanity cap ({_MAX_SANE_BLOCK_LENGTH})."
                 )
 
-            # FIX: PCAPNG block lengths must be a multiple of 4
-            if block_length % 4 != 0:
-                raise CaptureParseError(
-                    f"Block length {block_length} is not 4-byte aligned."
-                )
+            body_len = block_length - 12  # excludes 8-byte header and 4-byte trailer
 
-            # Read remainder of block (body + trailing length copy)
-            remainder = _read_exact(f, block_length - 8)
-
-            # Block body = remainder minus the trailing 4-byte length copy
-            block_body = remainder[: block_length - 12]
-
-            # ----------------------------------------------
-            # SHB inside the stream → new section, reset iface table
-            # ----------------------------------------------
+            # ---------- Section Header Block (may appear mid-stream) ----------
             if block_type == _BT_SHB:
+                body = _read_exact(f, body_len)
+                trailer_bytes = _read_exact(f, 4)
+                trailer_len = struct.unpack(endian + "I", trailer_bytes)[0]
+                if trailer_len != block_length:
+                    raise CaptureParseError("Block length trailer mismatch (SHB).")
+
+                # Re-evaluate endianness based on SHB BOM (new section)
+                bom2 = body[:4]
+                if bom2 == b"\x1a\x2b\x3c\x4d":
+                    endian = ">"
+                elif bom2 == b"\x4d\x3c\x2b\x1a":
+                    endian = "<"
+                else:
+                    raise CaptureParseError(f"Invalid SHB BOM in stream: {bom2.hex()}")
+
+                blk_hdr_struct = struct.Struct(endian + "II")
                 iface_tsresol.clear()
+                next_iface_id = 0
                 continue
 
-            # ----------------------------------------------
-            # IDB – parse if_tsresol option
-            # ----------------------------------------------
-            elif block_type == _BT_IDB:
-                # IDB body: uint16 LinkType, uint16 Reserved, uint32 SnapLen
-                # followed by options
-                iface_id = len(iface_tsresol)  # interfaces are 0-indexed in order
-                options_data = block_body[8:]   # skip fixed 8-byte IDB fields
-                opts = _parse_options(options_data, endian)
+            # ---------- Interface Description Block ----------
+            if block_type == _BT_IDB:
+                body = _read_exact(f, body_len)
+                trailer_bytes = _read_exact(f, 4)
+                trailer_len = struct.unpack(endian + "I", trailer_bytes)[0]
+                if trailer_len != block_length:
+                    raise CaptureParseError("Block length trailer mismatch (IDB).")
 
+                if len(body) < 8:
+                    raise CaptureParseError("IDB body too short.")
+
+                iface_id = next_iface_id
+                next_iface_id += 1
+
+                # default divisor for interfaces without explicit if_tsresol
+                iface_tsresol[iface_id] = _default_divisor()
+
+                # options after fixed 8-byte header
+                opts = _parse_options(body[8:], endian)
                 if _IDB_OPT_TSRESOL in opts:
                     tsresol_bytes = opts[_IDB_OPT_TSRESOL][0]
                     if tsresol_bytes:
-                        iface_tsresol[iface_id] = _tsresol_to_scale(
-                            tsresol_bytes[0]
-                        )
-                # If not present, _get_tsresol() will return the default 1e6
+                        iface_tsresol[iface_id] = _tsresol_to_scale(tsresol_bytes[0])
 
-            # ----------------------------------------------
-            # EPB – Enhanced Packet Block
-            # ----------------------------------------------
-            elif block_type == _BT_EPB:
-                if len(block_body) < 20:
+                continue
+
+            # ---------- Enhanced Packet Block ----------
+            if block_type == _BT_EPB:
+                if body_len < 20:
                     raise CaptureParseError("EPB body too short.")
+                epb_prefix = _read_exact(f, 20)
+                remaining = body_len - 20
+                if remaining:
+                    f.seek(remaining, os.SEEK_CUR)
+                trailer_bytes = _read_exact(f, 4)
+                trailer_len = struct.unpack(endian + "I", trailer_bytes)[0]
+                if trailer_len != block_length:
+                    raise CaptureParseError("Block length trailer mismatch (EPB).")
 
-                iface_id, ts_high, ts_low, _cap_len, _orig_len = \
-                    struct.unpack_from(endian + "IIIII", block_body, 0)
-
+                iface_id, ts_high, ts_low, _cap_len, _orig_len = struct.unpack(endian + "IIIII", epb_prefix)
                 ts_64 = (ts_high << 32) | ts_low
-                timestamp = ts_64 / _get_tsresol(iface_id)
+                timestamp = ts_64 / _get_divisor(iface_id)
 
                 if first_ts is None:
                     first_ts = timestamp
                 last_ts = timestamp
+                continue
 
-            # ----------------------------------------------
-            # OPB – Obsolete Packet Block (FIX: was not handled before)
-            # ----------------------------------------------
-            elif block_type == _BT_OPB:
-                # OPB body: uint16 InterfaceID, uint16 DropsCount,
-                #           uint32 ts_high, uint32 ts_low,
-                #           uint32 cap_len, uint32 orig_len
-                if len(block_body) < 16:
+            # ---------- Obsolete Packet Block ----------
+            if block_type == _BT_OPB:
+                # OPB fixed fields (20 bytes per spec): iface_id(2), drops(2), ts_high(4), ts_low(4), cap_len(4), orig_len(4)
+                if body_len < 20:
                     raise CaptureParseError("OPB body too short.")
+                opb_prefix = _read_exact(f, 20)
+                remaining = body_len - 20
+                if remaining:
+                    f.seek(remaining, os.SEEK_CUR)
+                trailer_bytes = _read_exact(f, 4)
+                trailer_len = struct.unpack(endian + "I", trailer_bytes)[0]
+                if trailer_len != block_length:
+                    raise CaptureParseError("Block length trailer mismatch (OPB).")
 
-                iface_id_raw, _drops, ts_high, ts_low = \
-                    struct.unpack_from(endian + "HHII", block_body, 0)
-
+                iface_id_raw, _drops, ts_high, ts_low, _cap_len, _orig_len = struct.unpack(endian + "HHIIII", opb_prefix)
                 ts_64 = (ts_high << 32) | ts_low
-                timestamp = ts_64 / _get_tsresol(iface_id_raw)
+                timestamp = ts_64 / _get_divisor(iface_id_raw)
 
                 if first_ts is None:
                     first_ts = timestamp
                 last_ts = timestamp
+                continue
 
-            # SPB has no timestamp – skip silently (already consumed by seek)
+            # ---------- Other blocks (incl. SPB etc.): skip, but validate trailer ----------
+            if body_len:
+                f.seek(body_len, os.SEEK_CUR)
+            trailer_bytes = _read_exact(f, 4)
+            trailer_len = struct.unpack(endian + "I", trailer_bytes)[0]
+            if trailer_len != block_length:
+                raise CaptureParseError("Block length trailer mismatch (unknown block).")
 
         if first_ts is None:
-            raise CaptureParseError(
-                "No timestamped packets found in PCAPNG file."
-            )
+            raise CaptureParseError("No timestamped packets found in PCAPNG file.")
+
+        duration = max(0.0, float(last_ts - first_ts))
 
         return {
             "first_timestamp": first_ts,
             "last_timestamp": last_ts,
             "first_datetime": _to_utc_iso(first_ts),
             "last_datetime": _to_utc_iso(last_ts),
-            "duration_seconds": float(last_ts - first_ts),
+            "duration_seconds": duration,
         }
 
 
@@ -471,26 +433,19 @@ def _parse_pcapng_time_bounds(path: str) -> dict:
 # ==========================================================
 def get_capture_time_bounds(path: str) -> dict:
     """
-    Dispatch parsing based on file extension.
-
-    Returns a dict with keys:
+    Return a dict with keys:
         first_timestamp   (float, UNIX epoch)
         last_timestamp    (float, UNIX epoch)
         first_datetime    (str, ISO8601 UTC)
         last_datetime     (str, ISO8601 UTC)
         duration_seconds  (float)
     """
-    ext = os.path.splitext(path.lower())[1]
-
-    if ext == ".pcap":
+    fmt = _sniff_capture_format(path)
+    if fmt == "pcap":
         return _parse_pcap_time_bounds(path)
-    elif ext == ".pcapng":
+    if fmt == "pcapng":
         return _parse_pcapng_time_bounds(path)
-    else:
-        raise CaptureParseError(
-            f"Unsupported file extension '{ext}'. "
-            "Expected .pcap or .pcapng"
-        )
+    raise CaptureParseError("Unsupported capture format.")
 
 
 # ==========================================================
@@ -499,7 +454,6 @@ def get_capture_time_bounds(path: str) -> dict:
 def main(argv: list[str]) -> int:
     """
     Command-line usage:
-
         python pcap_timestamp.py capture.pcap
         python pcap_timestamp.py capture.pcapng
     """
@@ -510,12 +464,9 @@ def main(argv: list[str]) -> int:
     try:
         result = get_capture_time_bounds(argv[1])
 
-        print(f"First packet: {result['first_datetime']} "
-              f"({result['first_timestamp']})")
-        print(f"Last packet:  {result['last_datetime']} "
-              f"({result['last_timestamp']})")
+        print(f"First packet: {result['first_datetime']} ({result['first_timestamp']})")
+        print(f"Last packet:  {result['last_datetime']} ({result['last_timestamp']})")
         print(f"Duration:     {result['duration_seconds']:.6f} seconds")
-
         return 0
 
     except (CaptureParseError, EOFError, OSError) as e:
@@ -525,3 +476,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
+
