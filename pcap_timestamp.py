@@ -24,6 +24,7 @@ Highlights / Robustness Features:
         - block trailer-length validation
         - large packet blocks handled without reading full payload into memory
     • Defensive checks: 4-byte alignment, minimum sizes, sanity caps
+    • Out-of-order timestamp detection with explicit warning
 """
 
 import os
@@ -145,16 +146,16 @@ def _sniff_capture_format(path: str) -> str:
         if len(b) < 4:
             raise CaptureParseError("File too small to be a valid capture.")
 
-    # PCAPNG: block type of SHB at file start
-    if b == b"\x0a\x0d\x0d\x0a":
-        return "pcapng"
+        # PCAPNG: block type of SHB at file start
+        if b == b"\x0a\x0d\x0d\x0a":
+            return "pcapng"
 
-    # PCAP magic numbers (microsecond / nanosecond, both endians)
-    if b in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4",  # us
-             b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d"):  # ns
-        return "pcap"
+        # PCAP magic numbers (microsecond / nanosecond, both endians)
+        if b in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4",  # us
+                 b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d"):  # ns
+            return "pcap"
 
-    # fallback: extension
+    # fallback: extension (outside with-block; file already closed above)
     ext = os.path.splitext(path.lower())[1]
     if ext == ".pcapng":
         return "pcapng"
@@ -219,6 +220,13 @@ def _parse_pcap_time_bounds(path: str) -> dict:
         if first_ts is None:
             raise CaptureParseError("No packets found in PCAP file.")
 
+        if last_ts < first_ts:
+            import warnings
+            warnings.warn(
+                f"Out-of-order timestamps detected: last packet ({last_ts}) is "
+                f"earlier than first ({first_ts}). Duration clamped to 0.",
+                stacklevel=2,
+            )
         duration = max(0.0, float(last_ts - first_ts))
 
         return {
@@ -317,19 +325,26 @@ def _parse_pcapng_time_bounds(path: str, *, strict_iface: bool = False) -> dict:
             if block_type == _BT_SHB:
                 body = _read_exact(f, body_len)
                 trailer_bytes = _read_exact(f, 4)
-                trailer_len = struct.unpack(endian + "I", trailer_bytes)[0]
-                if trailer_len != block_length:
-                    raise CaptureParseError("Block length trailer mismatch (SHB).")
 
-                # Re-evaluate endianness based on SHB BOM (new section)
+                # FIX: Determine the NEW endianness from BOM *before* validating
+                # the trailer. If the new section flips byte order, using the old
+                # endian to unpack the trailer would produce a wrong value and
+                # raise a false "trailer mismatch" error.
                 bom2 = body[:4]
                 if bom2 == b"\x1a\x2b\x3c\x4d":
-                    endian = ">"
+                    new_endian = ">"
                 elif bom2 == b"\x4d\x3c\x2b\x1a":
-                    endian = "<"
+                    new_endian = "<"
                 else:
                     raise CaptureParseError(f"Invalid SHB BOM in stream: {bom2.hex()}")
 
+                # Validate trailer with the (potentially updated) endian
+                trailer_len = struct.unpack(new_endian + "I", trailer_bytes)[0]
+                if trailer_len != block_length:
+                    raise CaptureParseError("Block length trailer mismatch (SHB).")
+
+                # Commit endian change and rebuild the block-header struct
+                endian = new_endian
                 blk_hdr_struct = struct.Struct(endian + "II")
                 iface_tsresol.clear()
                 next_iface_id = 0
@@ -417,6 +432,13 @@ def _parse_pcapng_time_bounds(path: str, *, strict_iface: bool = False) -> dict:
         if first_ts is None:
             raise CaptureParseError("No timestamped packets found in PCAPNG file.")
 
+        if last_ts < first_ts:
+            import warnings
+            warnings.warn(
+                f"Out-of-order timestamps detected: last packet ({last_ts}) is "
+                f"earlier than first ({first_ts}). Duration clamped to 0.",
+                stacklevel=2,
+            )
         duration = max(0.0, float(last_ts - first_ts))
 
         return {
@@ -476,4 +498,3 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
-
