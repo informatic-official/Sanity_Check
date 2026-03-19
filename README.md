@@ -39,8 +39,9 @@ Lightweight Python validator for recording session folders with this structure:
 - `session-name` and `session-uuid` match the session folder
 - `start-time` ↔ `start-timestamp-utc-us` consistency
 - `end-time` ↔ `end-timestamp-utc-us` consistency
+- UTC-string and epoch comparison is normalized to millisecond precision
 - `duration == (end-timestamp-utc-us - start-timestamp-utc-us) / 1_000_000`
-- Session folder timestamp is within `[start-time, end-time]`
+- Session folder timestamp matches `start-time` using lower precision alignment
 - VIN validation using ISO 3779 checksum
 - `car-line` is in allowed list
 - `rev-release` is in supported list
@@ -75,15 +76,35 @@ python -m session_validator.validate_session "<session_dir>" \
   --valid-car-lines 174 177 \
   --supported-rev-releases rev-26.01 rev-26.02 \
   --expected-ncd-versions 26.01 26.02 \
-  --expected-project gen7
+  --expected-project gen7 \
+  --verbose
 ```
 
 Defaults are defined in `config.py`:
 
 - `valid_car_lines = {"174"}`
-- `supported_rev_releases = {"rev-26.01"}`
-- `expected_ncd_versions = {"26.01"}`
+- `supported_rev_releases = {"rev-25.01"}`
+- `expected_ncd_versions = {"25.05"}`
 - `expected_project = "gen7"`
+
+Persistent default-list management from terminal:
+
+```powershell
+python -m session_validator.manage_defaults list
+python -m session_validator.manage_defaults add --target car-line 177 178
+python -m session_validator.manage_defaults add --target ncd-version 26.01
+python -m session_validator.manage_defaults add --target rev-release rev-26.01
+```
+
+Notes:
+
+- Managed values are saved in `session_validator/defaults.json`.
+- `validate_session` uses these persisted defaults when corresponding CLI list options are not provided.
+
+Debug/verbose output:
+
+- `--verbose`: print detailed per-rule PASS/FAIL checks with concrete values
+- `--debug`: alias of `--verbose`
 
 ## Exit code
 

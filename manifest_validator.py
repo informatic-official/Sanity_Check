@@ -82,20 +82,38 @@ def validate_manifest_content(session_dir: Path, manifest: dict[str, Any], resul
         referenced_rel_paths.add(normalized)
         absolute_path = session_dir / Path(normalized)
 
-        if not absolute_path.exists():
+        exists_ok = absolute_path.exists()
+        result.check(
+            f"manifest reference exists [{normalized}]",
+            exists_ok,
+            f"path={absolute_path}",
+        )
+        if not exists_ok:
             result.error(
                 f"recording_manifest.json: referenced file does not exist: {normalized}"
             )
             continue
 
-        if not absolute_path.is_file():
+        file_ok = absolute_path.is_file()
+        result.check(
+            f"manifest reference is file [{normalized}]",
+            file_ok,
+            f"path={absolute_path}",
+        )
+        if not file_ok:
             result.error(
                 f"recording_manifest.json: referenced path is not a file: {normalized}"
             )
             continue
 
         actual_size = absolute_path.stat().st_size
-        if actual_size != expected_size:
+        size_ok = actual_size == expected_size
+        result.check(
+            f"manifest expected_size matches [{normalized}]",
+            size_ok,
+            f"expected={expected_size}, actual={actual_size}",
+        )
+        if not size_ok:
             result.error(
                 "recording_manifest.json: size mismatch for "
                 f"{normalized}, expected={expected_size}, actual={actual_size}"

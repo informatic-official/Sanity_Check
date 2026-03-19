@@ -1,0 +1,11 @@
+{
+  "valid_car_lines": [
+    "174"
+  ],
+  "supported_rev_releases": [
+    "rev-25.01"
+  ],
+  "expected_ncd_versions": [
+    "25.05"
+  ]
+}

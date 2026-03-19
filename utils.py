@@ -23,6 +23,7 @@ class ValidationResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     infos: list[str] = field(default_factory=list)
+    verbose: bool = False
 
     def error(self, message: str) -> None:
         self.errors.append(message)
@@ -32,6 +33,14 @@ class ValidationResult:
 
     def info(self, message: str) -> None:
         self.infos.append(message)
+
+    def check(self, name: str, passed: bool, detail: str | None = None) -> None:
+        """Record per-rule pass/fail detail in verbose mode."""
+        if not self.verbose:
+            return
+        status = "PASS" if passed else "FAIL"
+        suffix = f" | {detail}" if detail else ""
+        self.infos.append(f"{status}: {name}{suffix}")
 
     @property
     def ok(self) -> bool:
@@ -87,6 +96,16 @@ def parse_iso_datetime_utc(text: str) -> datetime | None:
 def datetime_to_epoch_us(dt: datetime) -> int:
     """Convert datetime to unix epoch in microseconds."""
     return int(dt.timestamp() * 1_000_000)
+
+
+def datetime_to_epoch_ms(dt: datetime) -> int:
+    """Convert datetime to unix epoch in milliseconds."""
+    return int(dt.timestamp() * 1_000)
+
+
+def epoch_us_to_ms(epoch_us: int) -> int:
+    """Convert unix epoch microseconds to milliseconds by truncation."""
+    return epoch_us // 1_000
 
 
 def load_json_file(path: Path) -> Any:
